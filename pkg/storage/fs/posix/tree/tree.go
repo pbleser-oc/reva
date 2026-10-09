@@ -55,6 +55,7 @@ import (
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/metadata/prefixes"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/node"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/permissions"
+	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/revisioncleanup"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/tree/propagator"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/usermapper"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/utils/templates"
@@ -108,6 +109,9 @@ type Tree struct {
 	// files that failed to assimilate, keyed by path, see updateFile()
 	assimilationFailures *assimilation.Failures
 
+	// deletes old revisions after a change on disk created a new one, nil if disabled
+	revisionsCleaner *revisioncleanup.Cleaner
+
 	es  events.Stream
 	log *zerolog.Logger
 }
@@ -140,6 +144,16 @@ func New(lu node.PathLookup, bs node.Blobstore, um usermapper.Mapper, trashbin *
 	}
 	t.idResolver = t.lookup
 	t.assimilateFunc = t.assimilate
+	// The tree creates the revisions cleaner itself, as assimilation needs it for
+	// revisions created from changes on disk, and the watcher started below may
+	// assimilate right away. posix.New passes the same instance on to Decomposedfs
+	// through the aspects (see RevisionsCleaner). An invalid strategy fails startup
+	// rather than silently keeping or deleting revisions the admin did not expect.
+	revisionsCleaner, err := revisioncleanup.New(o.RevisionsCleanupStrategy)
+	if err != nil {
+		return nil, errors.Wrap(err, "tree: invalid revisions cleanup strategy")
+	}
+	t.revisionsCleaner = revisionsCleaner
 	if err := t.checkStorage(); err != nil {
 		return nil, errors.Wrap(err, "tree: unfit storage '"+o.Root+"'")
 	}
@@ -755,6 +769,13 @@ func (t *Tree) DeleteBlob(node *node.Node) error {
 		return fmt.Errorf("could not delete blob, nil node was given")
 	}
 	return t.blobstore.Delete(node)
+}
+
+// RevisionsCleaner returns the cleaner deleting old revisions, nil if disabled.
+// It is used to hand the same instance to Decomposedfs via aspects.Aspects, so that
+// uploads, restores and changes on disk are all cleaned up by the same strategy.
+func (t *Tree) RevisionsCleaner() *revisioncleanup.Cleaner {
+	return t.revisionsCleaner
 }
 
 // BuildSpaceIDIndexEntry returns the entry for the space id index

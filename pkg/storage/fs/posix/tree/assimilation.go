@@ -40,6 +40,7 @@ import (
 
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 
+	"github.com/opencloud-eu/reva/v2/pkg/appctx"
 	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
 	"github.com/opencloud-eu/reva/v2/pkg/events"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/fs/posix/watcher"
@@ -837,6 +838,26 @@ assimilate:
 				if err != nil {
 					t.log.Error().Err(err).Str("path", path).Str("revisionPath", revisionPath).Msg("could not create revision")
 					return
+				}
+
+				// A change on disk has just created a revision, apply the revision cleanup
+				// strategy (see package revisioncleanup). This is the only trigger for those
+				// revisions: they are created by the rename above and never go through
+				// CreateRevision or the upload code, where the other triggers are.
+				// It runs before the new content is copied to the current file below, so the
+				// cleanup is complete once '.CURRENT' holds the new content.
+				// Cleanup takes the node lock itself. If the assimilation that started this
+				// goroutine still holds it, Cleanup just waits, as nothing waits for this
+				// goroutine there is no deadlock.
+				// context.Background() carries no logger, pass t.log on or the cleanup's
+				// logging would be lost.
+				// The cleanup gets a node of its own: n is still used by the assimilation
+				// that started this goroutine, and a node caches state without locking.
+				ctx := appctx.WithLogger(context.Background(), t.log)
+				if cn, err := node.ReadNode(ctx, t.lookup, n.SpaceID, n.ID, "", false, nil, false); err != nil {
+					t.log.Error().Err(err).Str("path", path).Msg("revision cleanup: could not read node")
+				} else {
+					t.revisionsCleaner.Cleanup(ctx, t.lookup, t, cn)
 				}
 			}
 

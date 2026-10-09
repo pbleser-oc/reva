@@ -22,6 +22,7 @@ import (
 	"github.com/opencloud-eu/reva/v2/pkg/events"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/node"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/permissions"
+	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/revisioncleanup"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/trashbin"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/usermapper"
 )
@@ -35,4 +36,8 @@ type Aspects struct {
 	EventStream       events.Stream
 	DisableVersioning bool
 	UserMapper        usermapper.Mapper
+	// RevisionsCleaner deletes old revisions after new ones have been created, nil disables it.
+	// It is passed in here rather than created by Decomposedfs because posix needs the
+	// same instance in its own tree, for revisions created from changes on disk.
+	RevisionsCleaner *revisioncleanup.Cleaner
 }
