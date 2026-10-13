@@ -71,6 +71,14 @@
 // configurable (AsyncOptions). With revisions_cleanup_async disabled, HandleRevisionCreated runs the
 // cleanup right away, in the caller's goroutine.
 //
+// # Metrics
+//
+// The cleanup exports Prometheus metrics (see metrics.go), all named
+// reva_revision_cleanup_*: counters of deleted revisions, deleted bytes, failed deletions
+// and requests that found the queue full, and gauges of the queue length and capacity, the
+// workers, the running cleanups and whether the cleanup is enabled. The queue and worker
+// gauges are summed over all Services of the process.
+//
 // Overlapping uploads: the processing status only tracks the latest upload of a node, so a
 // cleanup triggered by a newer upload doesn't see an older one that is still in
 // postprocessing. That is safe: if the cleanup deletes the revision the older upload writes
@@ -253,10 +261,13 @@ func (c *Cleaner) Cleanup(ctx context.Context, lu node.PathLookup, rs RevisionSt
 			}
 		}
 		if err := PurgeRevision(ctx, rs, n, rev.Key()); err != nil {
+			PurgeFailures.Inc()
 			return fmt.Errorf("could not purge revision %s: %w", rev.Key(), err)
 		}
 		purged++
 		purgedBytes += rev.Size()
+		RevisionsDeleted.Inc()
+		BytesDeleted.Add(float64(rev.Size()))
 		log.Debug().Str("revision", rev.Key()).Uint64("size", rev.Size()).Msg("revision cleanup: purged revision")
 		return nil
 	})

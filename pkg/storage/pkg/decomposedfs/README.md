@@ -305,7 +305,7 @@ Shared building blocks that both trees use instead of re-implementing them:
 - `tree/propagator` – tree size and mtime propagation (used by both trees)
 - `upload` – TUS upload sessions, `Finalize`, postprocessing integration
 - `permissions` – CS3 permission assembly from grants and the permissions service
-- `revisioncleanup` – applying the revision cleanup strategy, right away or in background workers
+- `revisioncleanup` – applying the revision cleanup strategy, right away or in background workers; its configuration, strategies and metrics are documented in [`revisioncleanup/README.md`](revisioncleanup/README.md)
 
 ### What differs per component
 
