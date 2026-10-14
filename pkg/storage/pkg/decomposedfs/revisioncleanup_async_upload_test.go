@@ -99,7 +99,7 @@ var _ = Describe("Revision cleanup of async uploads", func() {
 
 		pub, con = make(chan any), make(chan any)
 		tp = tree.New(lu, bs, o, p, store.Create(), &zerolog.Logger{})
-		revisionsCleaner, err := revisioncleanup.New(o.RevisionsCleanupStrategy)
+		revisionsCleanup, err := revisioncleanup.NewServiceFromOptions(o, lu, tp, nil)
 		Expect(err).ToNot(HaveOccurred())
 		fs, err = New(o, aspects.Aspects{
 			Lookup:           lu,
@@ -107,7 +107,7 @@ var _ = Describe("Revision cleanup of async uploads", func() {
 			Permissions:      p,
 			EventStream:      stream.Chan{pub, con},
 			Trashbin:         &DecomposedfsTrashbin{},
-			RevisionsCleaner: revisionsCleaner,
+			RevisionsCleanup: revisionsCleanup,
 		}, &zerolog.Logger{})
 		Expect(err).ToNot(HaveOccurred())
 
@@ -120,6 +120,9 @@ var _ = Describe("Revision cleanup of async uploads", func() {
 	})
 
 	AfterEach(func() {
+		if fs != nil {
+			_ = fs.Shutdown(context.Background())
+		}
 		if o != nil && o.Root != "" {
 			_ = os.RemoveAll(o.Root)
 		}

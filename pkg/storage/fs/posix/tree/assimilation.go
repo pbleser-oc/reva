@@ -857,7 +857,7 @@ assimilate:
 				if cn, err := node.ReadNode(ctx, t.lookup, n.SpaceID, n.ID, "", false, nil, false); err != nil {
 					t.log.Error().Err(err).Str("path", path).Msg("revision cleanup: could not read node")
 				} else {
-					t.revisionsCleaner.Cleanup(ctx, t.lookup, t, cn)
+					t.revisionsCleanup.HandleRevisionCreated(ctx, cn)
 				}
 			}
 

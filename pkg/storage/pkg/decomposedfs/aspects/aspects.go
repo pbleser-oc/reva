@@ -36,8 +36,9 @@ type Aspects struct {
 	EventStream       events.Stream
 	DisableVersioning bool
 	UserMapper        usermapper.Mapper
-	// RevisionsCleaner deletes old revisions after new ones have been created, nil disables it.
-	// It is passed in here rather than created by Decomposedfs because posix needs the
-	// same instance in its own tree, for revisions created from changes on disk.
-	RevisionsCleaner *revisioncleanup.Cleaner
+	// RevisionsCleanup deletes old revisions after new ones have been created, right away or in
+	// background workers, nil disables it. It is passed in here rather than created by
+	// Decomposedfs because posix needs the same instance (and the same workers) in its own
+	// tree, for revisions created from changes on disk.
+	RevisionsCleanup *revisioncleanup.Service
 }
