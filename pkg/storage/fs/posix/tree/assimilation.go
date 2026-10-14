@@ -832,6 +832,9 @@ assimilate:
 			currentPath := currentNode.InternalPath()
 			stat, err := os.Stat(currentPath)
 			if err == nil {
+				// named after the mtime of the content it preserves, not after the time it is
+				// created; the revision cleanup takes the age of a revision from this name
+				// (see revisioncleanup.revisionTime)
 				revisionPath := t.lookup.VersionPath(n.SpaceID, n.ID, stat.ModTime().UTC().Format(time.RFC3339Nano))
 
 				err = os.Rename(currentPath, revisionPath)
