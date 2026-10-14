@@ -26,6 +26,6 @@ func newDisabledRevisionCleanupStrategy() (RevisionCleanupStrategy, error) {
 
 func (s *disabledRevisionCleanupStrategy) Cleanup(now time.Time, revs []Revision, ctx context.Context, logger *zerolog.Logger) (Plan, error) {
 	plan := NewSimplePlan()
-	plan.Safeguard(revs...)
+	plan.Safeguard(`protected: the revision cleanup is "disabled"`, revs...)
 	return plan, nil
 }
