@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -114,6 +115,11 @@ type Service struct {
 	report func(Result)
 	// the metrics this Service updates, see m
 	metrics *serviceMetrics
+	// set for the Service of an on-demand Run: it leaves the metrics of the storage driver's
+	// Service alone (see unregisteredMetrics), and it can be stopped through the caller's
+	// context: a caller blocked on a full queue gives up when its context ends, and a cleanup
+	// in synchronous mode always finishes its file, see HandleRevisionCreated
+	onDemand bool
 
 	async   bool
 	policy  QueueFullPolicy
@@ -202,7 +208,7 @@ func newService(cleaner *Cleaner, lu node.PathLookup, rs RevisionStore, opts Asy
 	if log == nil {
 		log = &zerolog.Logger{}
 	}
-	s := &Service{cleaner: cleaner, lu: lu, rs: rs, log: log, dryRun: dryRun, report: report}
+	s := &Service{cleaner: cleaner, lu: lu, rs: rs, log: log, onDemand: onDemand, dryRun: dryRun, report: report}
 	if onDemand {
 		s.metrics = unregisteredMetrics()
 	}
@@ -243,20 +249,29 @@ func (s *Service) startWorkers(workers, queueSize int, policy QueueFullPolicy, p
 // see Service and AsyncOptions.
 // Errors are logged, never returned: a failed cleanup must not fail the operation that
 // triggered it.
+//
+// In an on-demand Run, the end of ctx stops the run between files: a cleanup in synchronous
+// mode still finishes its file, and a caller blocked on a full queue gives up, reporting the
+// file as skipped.
 func (s *Service) HandleRevisionCreated(ctx context.Context, n *node.Node, keep ...string) {
 	if s == nil || n == nil {
 		return
 	}
 	if !s.async {
+		if s.onDemand {
+			// don't leave a file half cleaned up, the run stops before the next one
+			ctx = context.WithoutCancel(ctx)
+		}
 		s.clean(ctx, n, keep)
 		return
 	}
 	// the cleanup outlives the request that triggered it, but keeps its values,
 	// e.g. the logger and the trace context
-	s.enqueue(&request{ctx: context.WithoutCancel(ctx), spaceID: n.SpaceID, nodeID: n.ID, keep: slices.Clone(keep)})
+	s.enqueue(ctx, &request{ctx: context.WithoutCancel(ctx), spaceID: n.SpaceID, nodeID: n.ID, keep: slices.Clone(keep)})
 }
 
-func (s *Service) enqueue(r *request) {
+// enqueue queues r; ctx is the caller's context, which only an on-demand Run waits on.
+func (s *Service) enqueue(ctx context.Context, r *request) {
 	log := appctx.GetLogger(r.ctx).With().Str("spaceid", r.spaceID).Str("nodeid", r.nodeID).Logger()
 	key := r.key()
 
@@ -288,12 +303,13 @@ func (s *Service) enqueue(r *request) {
 	s.addPending()
 	s.m().queueLength.Inc()
 	s.mu.Unlock()
-	s.send(r)
+	s.send(ctx, r)
 }
 
 // send puts r, which waits in s.queued, into the queue, applying the queue full policy.
 // s.mu is not held while sending, so that a blocked sender does not block the workers.
-func (s *Service) send(r *request) {
+// ctx is the caller's context, see enqueue.
+func (s *Service) send(ctx context.Context, r *request) {
 	log := appctx.GetLogger(r.ctx).With().Str("spaceid", r.spaceID).Str("nodeid", r.nodeID).Logger()
 	select {
 	case s.queue <- r:
@@ -302,30 +318,46 @@ func (s *Service) send(r *request) {
 	}
 	if s.policy == QueueFullDrop {
 		s.m().queueFull.WithLabelValues(queueFullDropped).Inc()
-		s.reportResult(Result{SpaceID: r.spaceID, NodeID: r.nodeID, DryRun: s.dryRun,
-			Skipped: fmt.Sprintf("the queue was full (queue full policy %q)", QueueFullDrop)})
-		s.forget(r)
+		if s.forget(r) {
+			s.reportResult(Result{SpaceID: r.spaceID, NodeID: r.nodeID, DryRun: s.dryRun,
+				Skipped: fmt.Sprintf("the queue was full (queue full policy %q)", QueueFullDrop)})
+		}
 		log.Warn().Msg("revision cleanup: queue is full, skipping the cleanup of this node until its next revision")
 		return
 	}
 	s.m().queueFull.WithLabelValues(queueFullBlocked).Inc()
 	log.Debug().Msg("revision cleanup: queue is full, waiting for room")
+	var stopped <-chan struct{} // nil, i.e. never, unless on demand
+	if s.onDemand {
+		stopped = ctx.Done()
+	}
 	select {
 	case s.queue <- r:
 	case <-s.done:
+		// Shutdown abandoned (and reported) it
 		s.forget(r)
+	case <-stopped:
+		if s.forget(r) {
+			s.reportResult(Result{SpaceID: r.spaceID, NodeID: r.nodeID, DryRun: s.dryRun, Skipped: skippedStopped})
+		}
 	}
 }
 
-// forget removes a request that did not make it into the queue.
-func (s *Service) forget(r *request) {
+// the reason for skipping files whose cleanup was queued when an on-demand run was stopped
+const skippedStopped = "the cleanup was stopped before this file was reached"
+
+// forget removes a request that did not make it into the queue. It returns false if the
+// request was not waiting anymore, e.g. as Shutdown abandoned it.
+func (s *Service) forget(r *request) bool {
 	s.mu.Lock()
-	if s.queued[r.key()] == r {
-		delete(s.queued, r.key())
-		s.m().queueLength.Dec()
-		s.donePending(1)
+	defer s.mu.Unlock()
+	if s.queued[r.key()] != r {
+		return false
 	}
-	s.mu.Unlock()
+	delete(s.queued, r.key())
+	s.m().queueLength.Dec()
+	s.donePending(1)
+	return true
 }
 
 func (s *Service) work() {
@@ -382,7 +414,8 @@ func (s *Service) work() {
 			// room in the queue it empties. QueueLength and pending already count the request.
 			s.queued[again.key()] = again
 			s.mu.Unlock()
-			go s.send(again)
+			// No caller waits for it: in an on-demand Run, Shutdown stops it.
+			go s.send(context.Background(), again)
 		}
 	}
 }
@@ -473,8 +506,9 @@ func (s *Service) Wait(ctx context.Context) error {
 }
 
 // Shutdown stops the background workers. A cleanup that is running is finished, the ones
-// still waiting in the queue are abandoned (and logged): they are picked up again when
-// their nodes get their next revision. Blocked callers are released. It returns when the
+// still waiting in the queue are abandoned (and logged, and reported as skipped in an
+// on-demand Run): they are picked up again when their nodes get their next revision.
+// Blocked callers are released. It returns when the
 // workers have stopped, or with ctx's error if ctx ends first.
 func (s *Service) Shutdown(ctx context.Context) error {
 	if s == nil || !s.async {
@@ -490,19 +524,33 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	// abandon the requests still waiting, in the queue or to be queued once more: they won't
 	// be processed anymore, and their nodes are cleaned up again when they get their next
 	// revision
-	abandoned := len(s.queued)
+	var abandonedRequests []*request
+	for _, r := range s.queued {
+		abandonedRequests = append(abandonedRequests, r)
+	}
 	clear(s.queued)
 	for key, r := range s.running {
 		if r != nil {
-			abandoned++
+			abandonedRequests = append(abandonedRequests, r)
 			s.running[key] = nil
 		}
+	}
+	abandoned := len(abandonedRequests)
+	var skipped []Result
+	if s.report != nil {
+		for _, r := range abandonedRequests {
+			skipped = append(skipped, Result{SpaceID: r.spaceID, NodeID: r.nodeID, DryRun: s.dryRun, Skipped: skippedStopped})
+		}
+		slices.SortFunc(skipped, func(a, b Result) int { return strings.Compare(a.SpaceID+"/"+a.NodeID, b.SpaceID+"/"+b.NodeID) })
 	}
 	s.donePending(abandoned)
 	s.m().queueLength.Sub(float64(abandoned))
 	s.m().workers.Sub(float64(s.workers))
 	s.m().queueCapacity.Sub(float64(s.queueSize))
 	s.mu.Unlock()
+	for _, result := range skipped {
+		s.reportResult(result)
+	}
 
 	stopped := make(chan struct{})
 	go func() {
