@@ -89,6 +89,8 @@ The cleanup skips a file while an upload to it is still being processed, as that
 Only the latest upload of a file is tracked, though: if an older upload is still being processed after a newer one finished, the cleanup runs anyway.
 That is safe: if it deletes the revision the older upload writes its content into, the older upload creates it again when it finishes, and the revision the older upload would roll back to after a failed postprocessing must not be restored anyway once a newer upload finished, as that would discard the newer upload's content.
 
+Files that are never changed again keep their revisions. To clean those up as well, or to apply a different strategy once, the cleanup can also run on demand for whole spaces, folders or files: in OpenCloud with the command `opencloud storage-users revisions cleanup`.
+
 ## Metrics
 
 The cleanup exports Prometheus metrics, all named `reva_revision_cleanup_*`.
@@ -111,6 +113,7 @@ Things to keep in mind:
 - **One process can have several queues.** The storageprovider and the dataprovider each create their own storage driver, and with it their own cleanup. The queue and worker gauges are the sum over all of them.
   Because a sum can hide one queue being full while another one is empty, `queue_full_total` counts every request that found its queue full.
   It is the most direct sign that there are too few workers or the queue is too small.
+- **On-demand cleanups only count their deletions.** A cleanup of whole spaces, folders or files on demand uses a queue and workers of its own, which the queue, worker and `enabled` metrics leave out, as they describe the cleanup that runs whenever a file gets a new revision. The revisions it deletes are counted in `revisions_deleted_total`, `bytes_deleted_total` and `purge_failures_total`.
 
 Example queries:
 
@@ -145,5 +148,4 @@ increase(reva_revision_cleanup_purge_failures_total[1h]) > 0
 
 ## Limitations
 
-- **Only files that get a new revision are cleaned up.** Revisions of files that are never changed again stay until an on-demand cleanup command is available.
 - **Shutdown:** cleanups still waiting in the queue are abandoned when the service stops. They are picked up again with the files' next revisions.

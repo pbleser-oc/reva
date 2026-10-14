@@ -108,6 +108,13 @@ type Service struct {
 	rs      RevisionStore
 	log     *zerolog.Logger
 
+	// set for the Service of an on-demand Run: only decide, don't delete, and hand the Result
+	// of every cleanup to report
+	dryRun bool
+	report func(Result)
+	// the metrics this Service updates, see m
+	metrics *serviceMetrics
+
 	async   bool
 	policy  QueueFullPolicy
 	process func(ctx context.Context, spaceID, nodeID string, keep []string)
@@ -159,12 +166,18 @@ func NewServiceFromOptions(o *options.Options, lu node.PathLookup, rs RevisionSt
 	if err != nil {
 		return nil, err
 	}
-	return NewService(cleaner, lu, rs, AsyncOptions{
+	return NewService(cleaner, lu, rs, AsyncOptionsFromOptions(o), log)
+}
+
+// AsyncOptionsFromOptions returns the AsyncOptions configured in the driver options
+// (the RevisionsCleanupAsync* settings).
+func AsyncOptionsFromOptions(o *options.Options) AsyncOptions {
+	return AsyncOptions{
 		Enabled:   o.RevisionsCleanupAsync,
 		Workers:   o.RevisionsCleanupAsyncWorkers,
 		QueueSize: o.RevisionsCleanupAsyncQueueSize,
 		QueueFull: QueueFullPolicy(o.RevisionsCleanupAsyncQueueFull),
-	}, log)
+	}
 }
 
 // NewService creates a Service that cleans up with the given Cleaner, and starts its
@@ -172,6 +185,13 @@ func NewServiceFromOptions(o *options.Options, lu node.PathLookup, rs RevisionSt
 // The options are validated in any case, so that invalid settings are reported even while
 // the cleanup is disabled.
 func NewService(cleaner *Cleaner, lu node.PathLookup, rs RevisionStore, opts AsyncOptions, log *zerolog.Logger) (*Service, error) {
+	return newService(cleaner, lu, rs, opts, log, false, false, nil)
+}
+
+// newService creates a Service, see NewService; onDemand creates the Service of an on-demand
+// Run, with dryRun it only decides without deleting, and report, if not nil, gets the Result
+// of every cleanup.
+func newService(cleaner *Cleaner, lu node.PathLookup, rs RevisionStore, opts AsyncOptions, log *zerolog.Logger, onDemand, dryRun bool, report func(Result)) (*Service, error) {
 	workers, queueSize, policy, err := opts.resolve()
 	if err != nil {
 		return nil, err
@@ -182,8 +202,11 @@ func NewService(cleaner *Cleaner, lu node.PathLookup, rs RevisionStore, opts Asy
 	if log == nil {
 		log = &zerolog.Logger{}
 	}
-	s := &Service{cleaner: cleaner, lu: lu, rs: rs, log: log}
-	Enabled.Set(1)
+	s := &Service{cleaner: cleaner, lu: lu, rs: rs, log: log, dryRun: dryRun, report: report}
+	if onDemand {
+		s.metrics = unregisteredMetrics()
+	}
+	s.m().enabled.Set(1)
 	if opts.Enabled {
 		s.startWorkers(workers, queueSize, policy, s.cleanupNode)
 		log.Info().Str("config", cleaner.config).Int("workers", workers).Int("queuesize", queueSize).
@@ -206,8 +229,8 @@ func (s *Service) startWorkers(workers, queueSize int, policy QueueFullPolicy, p
 	close(s.idle)
 	s.workers = workers
 	s.queueSize = queueSize
-	Workers.Add(float64(workers))
-	QueueCapacity.Add(float64(queueSize))
+	s.m().workers.Add(float64(workers))
+	s.m().queueCapacity.Add(float64(queueSize))
 	for range workers {
 		s.wg.Add(1)
 		go s.work()
@@ -225,7 +248,7 @@ func (s *Service) HandleRevisionCreated(ctx context.Context, n *node.Node, keep 
 		return
 	}
 	if !s.async {
-		s.cleaner.Cleanup(ctx, s.lu, s.rs, n, keep...)
+		s.clean(ctx, n, keep)
 		return
 	}
 	// the cleanup outlives the request that triggered it, but keeps its values,
@@ -254,7 +277,7 @@ func (s *Service) enqueue(r *request) {
 		if again == nil {
 			s.running[key] = r
 			s.addPending()
-			QueueLength.Inc()
+			s.m().queueLength.Inc()
 		} else {
 			again.merge(r)
 		}
@@ -263,7 +286,7 @@ func (s *Service) enqueue(r *request) {
 	}
 	s.queued[key] = r
 	s.addPending()
-	QueueLength.Inc()
+	s.m().queueLength.Inc()
 	s.mu.Unlock()
 	s.send(r)
 }
@@ -278,12 +301,14 @@ func (s *Service) send(r *request) {
 	default:
 	}
 	if s.policy == QueueFullDrop {
-		QueueFull.WithLabelValues(queueFullDropped).Inc()
+		s.m().queueFull.WithLabelValues(queueFullDropped).Inc()
+		s.reportResult(Result{SpaceID: r.spaceID, NodeID: r.nodeID, DryRun: s.dryRun,
+			Skipped: fmt.Sprintf("the queue was full (queue full policy %q)", QueueFullDrop)})
 		s.forget(r)
 		log.Warn().Msg("revision cleanup: queue is full, skipping the cleanup of this node until its next revision")
 		return
 	}
-	QueueFull.WithLabelValues(queueFullBlocked).Inc()
+	s.m().queueFull.WithLabelValues(queueFullBlocked).Inc()
 	log.Debug().Msg("revision cleanup: queue is full, waiting for room")
 	select {
 	case s.queue <- r:
@@ -297,7 +322,7 @@ func (s *Service) forget(r *request) {
 	s.mu.Lock()
 	if s.queued[r.key()] == r {
 		delete(s.queued, r.key())
-		QueueLength.Dec()
+		s.m().queueLength.Dec()
 		s.donePending(1)
 	}
 	s.mu.Unlock()
@@ -335,14 +360,14 @@ func (s *Service) work() {
 			}
 			if s.queued[r.key()] == r {
 				delete(s.queued, r.key())
-				QueueLength.Dec()
+				s.m().queueLength.Dec()
 			}
 			s.running[r.key()] = nil
 			keep := slices.Clone(r.keep)
 			s.mu.Unlock()
-			Running.Inc()
+			s.m().running.Inc()
 			s.process(r.ctx, r.spaceID, r.nodeID, keep)
-			Running.Dec()
+			s.m().running.Dec()
 			s.mu.Lock()
 			again := s.running[r.key()]
 			delete(s.running, r.key())
@@ -367,13 +392,41 @@ func (s *Service) cleanupNode(ctx context.Context, spaceID, nodeID string, keep 
 	n, err := node.ReadNode(ctx, s.lu, spaceID, nodeID, "", false, nil, false)
 	if err != nil {
 		appctx.GetLogger(ctx).Error().Err(err).Str("spaceid", spaceID).Str("nodeid", nodeID).Msg("revision cleanup: could not read node")
+		s.reportResult(Result{SpaceID: spaceID, NodeID: nodeID, DryRun: s.dryRun, Err: fmt.Errorf("could not read node: %w", err)})
 		return
 	}
 	if !n.Exists {
 		// deleted in the meantime, its revisions went with it (or into the trash)
+		s.reportResult(Result{SpaceID: spaceID, NodeID: nodeID, DryRun: s.dryRun, Skipped: "the file no longer exists"})
 		return
 	}
-	s.cleaner.Cleanup(ctx, s.lu, s.rs, n, keep...)
+	s.clean(ctx, n, keep)
+}
+
+// clean runs the cleanup of n, or only decides about it in a dry run, and reports the Result.
+func (s *Service) clean(ctx context.Context, n *node.Node, keep []string) {
+	var result Result
+	if s.dryRun {
+		result = s.cleaner.DryRun(ctx, s.lu, s.rs, n, keep...)
+	} else {
+		result = s.cleaner.Cleanup(ctx, s.lu, s.rs, n, keep...)
+	}
+	s.reportResult(result)
+}
+
+// m returns the metrics this Service updates: the exported ones, unless it is the Service of an
+// on-demand Run.
+func (s *Service) m() *serviceMetrics {
+	if s.metrics != nil {
+		return s.metrics
+	}
+	return &driverMetrics
+}
+
+func (s *Service) reportResult(result Result) {
+	if s.report != nil {
+		s.report(result)
+	}
 }
 
 // addPending counts a new request, s.mu must be held.
@@ -446,9 +499,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 	}
 	s.donePending(abandoned)
-	QueueLength.Sub(float64(abandoned))
-	Workers.Sub(float64(s.workers))
-	QueueCapacity.Sub(float64(s.queueSize))
+	s.m().queueLength.Sub(float64(abandoned))
+	s.m().workers.Sub(float64(s.workers))
+	s.m().queueCapacity.Sub(float64(s.queueSize))
 	s.mu.Unlock()
 
 	stopped := make(chan struct{})

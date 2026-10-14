@@ -563,6 +563,22 @@ func (t *Tree) Move(ctx context.Context, oldNode *node.Node, newNode *node.Node)
 
 // ListFolder lists the content of a folder node
 func (t *Tree) ListFolder(ctx context.Context, n *node.Node) ([]*node.Node, error) {
+	return t.listFolder(ctx, n, true)
+}
+
+var _ revisioncleanup.Walker = (*Tree)(nil)
+
+// ListAllChildren lists the children of n for maintenance, see revisioncleanup.Walker: unlike
+// ListFolder, it checks no permissions, and it skips the files and folders that are not known
+// to the storage yet instead of assimilating them, so that it changes nothing.
+func (t *Tree) ListAllChildren(ctx context.Context, n *node.Node) ([]*node.Node, error) {
+	return t.listFolder(ctx, n, false)
+}
+
+// listFolder lists the children of n. For users, it leaves out the ones denied to the user
+// in ctx and assimilates the ones not known yet; otherwise, for maintenance, it lists all
+// known children, see ListAllChildren.
+func (t *Tree) listFolder(ctx context.Context, n *node.Node, forUser bool) ([]*node.Node, error) {
 	ctx, span := tracer.Start(ctx, "ListFolder")
 	defer span.End()
 	dir := n.InternalPath()
@@ -638,6 +654,10 @@ func (t *Tree) ListFolder(ctx context.Context, n *node.Node) ([]*node.Node, erro
 						// silently turned into an assimilation attempt.
 						return errors.Wrap(err, "tree: error resolving ids for "+path)
 					}
+					if !forUser {
+						t.log.Debug().Str("path", path).Msg("skipping unknown entity while listing the directory")
+						continue
+					}
 					// we don't know about this node yet, assimilate it on the fly
 					t.log.Info().Err(err).Str("path", path).Msg("encountered unknown entity while listing the directory. Assimilate.")
 					err = t.assimilateFunc(scanItem{Path: path})
@@ -659,7 +679,7 @@ func (t *Tree) ListFolder(ctx context.Context, n *node.Node) ([]*node.Node, erro
 				}
 
 				// prevent listing denied resources
-				if !child.IsDenied(ctx) {
+				if !forUser || !child.IsDenied(ctx) {
 					if child.SpaceRoot == nil {
 						child.SpaceRoot = n.SpaceRoot
 					}

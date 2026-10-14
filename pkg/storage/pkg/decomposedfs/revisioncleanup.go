@@ -1,0 +1,154 @@
+// Copyright 2026 OpenCloud GmbH <mail@opencloud.eu>
+// SPDX-License-Identifier: Apache-2.0
+
+package decomposedfs
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+
+	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
+	"github.com/pkg/errors"
+
+	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
+	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/node"
+	"github.com/opencloud-eu/reva/v2/pkg/storage/pkg/decomposedfs/revisioncleanup"
+)
+
+var _ revisioncleanup.OnDemand = (*Decomposedfs)(nil)
+
+// CleanupRevisions cleans up the revisions of the files of whole spaces, or of a file or
+// folder within a space, on demand, see revisioncleanup.OnDemand. It is meant for command line
+// tools: it checks no permissions and needs no user in the context.
+//
+// With Request.All, a space that can't be cleaned up doesn't stop the others: a disabled space
+// (in the trash) is reported as skipped, any other one as failed. A space requested by its id
+// fails the request instead.
+//
+// The strategy and the AsyncOptions default to the configured ones (the
+// revisions_cleanup_* options) and can be overridden in the request.
+func (fs *Decomposedfs) CleanupRevisions(ctx context.Context, req revisioncleanup.Request, report func(revisioncleanup.Result)) error {
+	if err := req.Validate(); err != nil {
+		return err
+	}
+	w, ok := fs.tp.(revisioncleanup.Walker)
+	if !ok {
+		return errtypes.NotSupported("cleaning up revisions on demand, the tree can't list folders for maintenance")
+	}
+	if report == nil {
+		report = func(revisioncleanup.Result) {}
+	}
+
+	strategy := req.Strategy
+	if strategy == "" {
+		strategy = fs.o.RevisionsCleanupStrategy
+	}
+	cleaner, err := revisioncleanup.New(strategy)
+	if err != nil {
+		return errors.Wrap(err, "invalid revisions cleanup strategy")
+	}
+	if cleaner == nil {
+		return errors.New("no revisions cleanup strategy configured or given")
+	}
+	opts := revisioncleanup.AsyncOptionsFromOptions(fs.o)
+	if req.Async != nil {
+		opts = *req.Async
+	}
+
+	roots, err := fs.revisionCleanupRoots(ctx, req, report)
+	if err != nil {
+		return err
+	}
+	return revisioncleanup.Run(ctx, fs.lu, w, roots, cleaner, req.DryRun, opts, report, fs.log)
+}
+
+// errSpaceDisabled is the error for a space that is disabled, i.e. in the trash
+var errSpaceDisabled = errors.New("the space is disabled")
+
+// revisionCleanupRoots resolves the scope of the request to the nodes to clean up below. With
+// Request.All, it reports the spaces that can't be cleaned up and leaves them out.
+func (fs *Decomposedfs) revisionCleanupRoots(ctx context.Context, req revisioncleanup.Request, report func(revisioncleanup.Result)) ([]*node.Node, error) {
+	spaceIDs := req.SpaceIDs
+	if req.All {
+		ids, err := fs.allSpaceIDs()
+		if err != nil {
+			return nil, err
+		}
+		spaceIDs = ids
+	}
+
+	roots := make([]*node.Node, 0, len(spaceIDs))
+	for _, spaceID := range spaceIDs {
+		n, err := fs.revisionCleanupRoot(ctx, spaceID, req.Path)
+		switch {
+		case err == nil:
+			roots = append(roots, n)
+		case !req.All:
+			return nil, err
+		case errors.Is(err, errSpaceDisabled):
+			report(revisioncleanup.Result{SpaceID: spaceID, NodeID: spaceID, DryRun: req.DryRun, Skipped: errSpaceDisabled.Error()})
+		default:
+			// one space that can't be cleaned up doesn't stop the others
+			report(revisioncleanup.Result{SpaceID: spaceID, NodeID: spaceID, DryRun: req.DryRun, Err: err})
+		}
+	}
+	return roots, nil
+}
+
+// revisionCleanupRoot resolves the space, or the file or folder at path within it.
+func (fs *Decomposedfs) revisionCleanupRoot(ctx context.Context, spaceID, path string) (*node.Node, error) {
+	var n *node.Node
+	var err error
+	if path == "" {
+		n, err = fs.lu.NodeFromSpaceID(ctx, spaceID)
+	} else {
+		n, err = fs.lu.NodeFromResource(ctx, &provider.Reference{
+			ResourceId: &provider.ResourceId{SpaceId: spaceID, OpaqueId: spaceID},
+			Path:       "./" + strings.TrimLeft(path, "/"),
+		})
+	}
+	if err == nil && n != nil && n.Exists {
+		return n, nil
+	}
+	// the lookups don't find disabled spaces, tell them apart from missing ones
+	if root, rerr := node.ReadNode(ctx, fs.lu, spaceID, spaceID, "", true, nil, false); rerr == nil && root.Exists && root.IsDisabled(ctx) {
+		return nil, fmt.Errorf("space %s: %w", spaceID, errSpaceDisabled)
+	}
+	switch {
+	case err != nil:
+		return nil, errors.Wrapf(err, "could not find space %s", spaceID)
+	case path != "":
+		return nil, fmt.Errorf("no file or folder %q in space %s", path, spaceID)
+	default:
+		return nil, fmt.Errorf("no space %s", spaceID)
+	}
+}
+
+// allSpaceIDs lists the ids of all spaces from the space type index, of all space types,
+// without permission checks.
+func (fs *Decomposedfs) allSpaceIDs() ([]string, error) {
+	spaceTypes, err := fs.spaceTypeIndex.Indexes()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not list the space types")
+	}
+	ids := []string{}
+	for _, spaceType := range spaceTypes {
+		spaces, err := fs.spaceTypeIndex.Load(spaceType)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // no spaces of this type
+			}
+			return nil, errors.Wrapf(err, "could not read the index of %s spaces", spaceType)
+		}
+		for spaceID := range spaces {
+			if !slices.Contains(ids, spaceID) {
+				ids = append(ids, spaceID)
+			}
+		}
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
