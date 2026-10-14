@@ -133,6 +133,36 @@ func (lu *Lookup) IDsForPath(ctx context.Context, path string) (string, string, 
 	return spaceID, nodeID, nil
 }
 
+// SpacePathFromFSPath resolves a path on disk, as an admin sees it, to the space it is in and its
+// path relative to the space root ("" for the space root itself). Relative paths are taken
+// relative to the working directory; symlinks are not resolved. The file or folder must be
+// known to the id cache, i.e. assimilated.
+func (lu *Lookup) SpacePathFromFSPath(ctx context.Context, p string) (string, string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", "", err
+	}
+	if rel, err := filepath.Rel(lu.InternalRoot(), abs); err != nil || !filepath.IsLocal(rel) {
+		return "", "", errtypes.BadRequest(fmt.Sprintf("%s is not within the storage root %s", abs, lu.InternalRoot()))
+	}
+	spaceID, _, err := lu.IDsForPath(ctx, abs)
+	if err != nil {
+		return "", "", errtypes.NotFound(fmt.Sprintf("%s is not known to the storage: %v", abs, err))
+	}
+	spaceRoot, err := lu.GetCachedID(ctx, spaceID, spaceID)
+	if err != nil {
+		return "", "", errors.Wrapf(err, "could not find the root of space %s", spaceID)
+	}
+	rel, err := filepath.Rel(spaceRoot, abs)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", "", errtypes.InternalError(fmt.Sprintf("%s is not within the root %s of its space %s", abs, spaceRoot, spaceID))
+	}
+	if rel == "." {
+		rel = ""
+	}
+	return spaceID, rel, nil
+}
+
 // NodeFromPath returns the node for the given path
 func (lu *Lookup) NodeIDFromParentAndName(ctx context.Context, parent *node.Node, name string) (string, error) {
 	parentPath, err := lu.GetCachedID(ctx, parent.SpaceID, parent.ID)

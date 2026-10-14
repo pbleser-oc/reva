@@ -22,13 +22,17 @@ import (
 // The strategy and the AsyncOptions default to the configuration of the storage driver, and
 // can be overridden for this run.
 type Request struct {
-	// SpaceIDs are the spaces to clean up. Either SpaceIDs or All must be given.
+	// SpaceIDs are the spaces to clean up. Exactly one of SpaceIDs, All and FSPath must be given.
 	SpaceIDs []string
 	// All cleans up all spaces.
 	All bool
 	// Path narrows the cleanup down to a file or a folder (recursively) within the space,
 	// relative to the space root. It requires exactly one space in SpaceIDs.
 	Path string
+	// FSPath is a file or folder (recursively) given by its path on disk, as an admin sees it.
+	// Only drivers that keep files under their own names on disk support it, i.e. posix, which
+	// resolves it to the space and the path within it.
+	FSPath string
 
 	// Strategy overrides the configured revisions cleanup strategy for this run, see
 	// revisions.NewRevisionCleanupStrategy.
@@ -42,6 +46,10 @@ type Request struct {
 // Validate checks the scope of the request.
 func (r Request) Validate() error {
 	switch {
+	case r.FSPath != "" && (r.All || len(r.SpaceIDs) > 0 || r.Path != ""):
+		return errors.New("a path on disk can't be combined with spaces or a path within a space")
+	case r.FSPath != "":
+		return nil
 	case r.All && len(r.SpaceIDs) > 0:
 		return errors.New("either all spaces or specific spaces can be cleaned up, not both")
 	case !r.All && len(r.SpaceIDs) == 0:
